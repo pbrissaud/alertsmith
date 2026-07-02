@@ -44,8 +44,13 @@ type ruleNode struct {
 	Annotations yaml.Node `yaml:"annotations"`
 }
 
-// File reads and parses a native flat Prometheus rule file.
-func File(path string) (*ir.PrometheusRule, error) {
+// File reads and parses a Prometheus rule file into its resources.
+//
+// A file holds zero or more PrometheusRule resources (a resource is not a file
+// — ADR 0015): one native flat document today, and with #2 several `---`
+// documents, a CRD, or a mix. The walking skeleton parses a single flat
+// document, so the slice has one element; #2 makes it additive.
+func File(path string) ([]ir.PrometheusRule, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -53,15 +58,15 @@ func File(path string) (*ir.PrometheusRule, error) {
 	return Bytes(path, data)
 }
 
-// Bytes parses native flat rule content already in memory. The file name is
-// only used to stamp provenance.
-func Bytes(file string, data []byte) (*ir.PrometheusRule, error) {
+// Bytes parses rule content already in memory into its resources. The file name
+// is only used to stamp provenance.
+func Bytes(file string, data []byte) ([]ir.PrometheusRule, error) {
 	var doc flatDoc
 	if err := yaml.Unmarshal(data, &doc); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", file, err)
 	}
 
-	pr := &ir.PrometheusRule{File: file, Format: ir.FormatFlat}
+	pr := ir.PrometheusRule{File: file, Format: ir.FormatFlat}
 	for _, g := range doc.Groups {
 		group := ir.Group{
 			Name: field(file, &g.Name),
@@ -72,7 +77,7 @@ func Bytes(file string, data []byte) (*ir.PrometheusRule, error) {
 		}
 		pr.Groups = append(pr.Groups, group)
 	}
-	return pr, nil
+	return []ir.PrometheusRule{pr}, nil
 }
 
 func rule(file string, r *ruleNode) ir.Rule {
@@ -82,19 +87,44 @@ func rule(file string, r *ruleNode) ir.Rule {
 		Labels:      mapping(file, &r.Labels),
 		Annotations: mapping(file, &r.Annotations),
 	}
-	// A rule is recording iff it carries `record:`, otherwise alerting; the
-	// name and the rule's own position follow whichever key is present.
+	// A valid rule carries exactly one of `alert:`/`record:`. Neither or both is
+	// an Invalid rule — we do NOT guess a flavour (that would mislabel a broken
+	// rule as alerting and trigger a cascade of phantom #7 findings). The
+	// rule-structure check (#6) spells out which degenerate case it is.
+	hasAlert, hasRecord := present(&r.Alert), present(&r.Record)
 	switch {
-	case present(&r.Record):
+	case hasRecord && !hasAlert:
 		out.Kind = ir.Recording
 		out.Name = field(file, &r.Record)
 		out.Pos = pos(file, &r.Record)
-	default:
+	case hasAlert && !hasRecord:
 		out.Kind = ir.Alerting
 		out.Name = field(file, &r.Alert)
 		out.Pos = pos(file, &r.Alert)
+	default:
+		out.Kind = ir.Invalid
+		// Name follows whichever key exists (the both-case); empty when neither.
+		if hasAlert {
+			out.Name = field(file, &r.Alert)
+		} else if hasRecord {
+			out.Name = field(file, &r.Record)
+		}
+		// Point at any present leaf so a rule-level Finding is never stranded at
+		// line 0 (except a wholly empty `- {}` block, which has nothing to point at).
+		out.Pos = firstPos(file, &r.Alert, &r.Record, &r.Expr, &r.For, &r.Labels, &r.Annotations)
 	}
 	return out
+}
+
+// firstPos returns the position of the first present node, so a Finding on a
+// rule with no name node can still point at something real.
+func firstPos(file string, nodes ...*yaml.Node) ir.Position {
+	for _, n := range nodes {
+		if present(n) {
+			return pos(file, n)
+		}
+	}
+	return ir.Position{File: file}
 }
 
 // mapping reconstructs a labels/annotations block into value+position fields,

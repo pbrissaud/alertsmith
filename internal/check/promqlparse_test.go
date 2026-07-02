@@ -10,11 +10,15 @@ import (
 
 func run(t *testing.T, src string) []finding.Finding {
 	t.Helper()
-	pr, err := parse.Bytes("mem.yaml", []byte(src))
+	prs, err := parse.Bytes("mem.yaml", []byte(src))
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	return PromQLParse{}.Check(pr)
+	var out []finding.Finding
+	for i := range prs {
+		out = append(out, PromQLParse{}.Check(&prs[i])...)
+	}
+	return out
 }
 
 func TestPromQLParse_flagsBadExpr(t *testing.T) {

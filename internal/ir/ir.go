@@ -35,22 +35,52 @@ type Field struct {
 // Present reports whether the field was actually set in the source. A zero
 // Field (no position) means the key was absent — the distinction most
 // "missing-*" checks rely on.
+//
+// INVARIANT: presence is deliberately welded to provenance. Every present leaf
+// originates from a positioned yaml.Node (ADR 0001 mandates yaml.Node leaves for
+// both the native and CRD formats — no decode into operator Go types that would
+// drop the line), so a present Field always carries a non-zero Pos.Line. This is
+// a feature, not a coincidence: a value we cannot point at is unrenderable as a
+// check-run annotation (ADR 0011). If a leaf ever has a value but no position,
+// that is a parser bug this coupling surfaces early — not a case to paper over.
+// Only introduce a separate `set bool` if V1 ever fabricates a value with no
+// source line (e.g. a defaulted annotation); no such path exists today.
 func (f Field) Present() bool { return f.Pos.Line != 0 }
 
-// Kind distinguishes the two rule flavours Prometheus supports.
+// Kind distinguishes the two rule flavours Prometheus supports, plus the
+// degenerate case. A rule block must carry exactly one of `alert:`/`record:`.
 type Kind int
 
 const (
+	// Invalid is a rule block that carries neither or both of `alert:`/`record:`
+	// — not a valid single-purpose rule. It is the zero value on purpose (a
+	// fail-safe: an unclassified rule is never silently treated as an alerting
+	// rule). rulefmt rejects such blocks; the rule-structure check (#6) owns the
+	// precise Finding, and alerting-only checks (#7) skip Invalid rules to avoid
+	// a cascade of phantom findings on an already-broken rule.
+	Invalid Kind = iota
 	// Alerting is a rule that fires an alert when its PromQL is true (`alert:`).
-	Alerting Kind = iota
+	Alerting
 	// Recording is a rule that precomputes a derived metric (`record:`).
 	Recording
 )
 
-// Rule is a single alerting or recording rule, normalised.
+func (k Kind) String() string {
+	switch k {
+	case Alerting:
+		return "alerting"
+	case Recording:
+		return "recording"
+	default:
+		return "invalid"
+	}
+}
+
+// Rule is a single alerting, recording or invalid rule, normalised.
 type Rule struct {
 	Kind Kind
 	// Name is the alert name (`alert:`) or recorded metric name (`record:`).
+	// Empty for an Invalid rule that carries neither key.
 	Name Field
 	Expr Field
 	// For is optional; check Present() before use.

@@ -6,11 +6,22 @@ import (
 	"github.com/pbrissaud/alertsmith/internal/ir"
 )
 
-func TestFile_flat(t *testing.T) {
-	pr, err := File("testdata/flat.yaml")
+// single asserts the file/bytes parsed to exactly one resource and returns it.
+// A file holds 0..n resources (ADR 0015); the flat walking skeleton yields one.
+func single(t *testing.T, prs []ir.PrometheusRule, err error) ir.PrometheusRule {
+	t.Helper()
 	if err != nil {
-		t.Fatalf("File: %v", err)
+		t.Fatalf("parse: %v", err)
 	}
+	if len(prs) != 1 {
+		t.Fatalf("resources = %d, want 1", len(prs))
+	}
+	return prs[0]
+}
+
+func TestFile_flat(t *testing.T) {
+	prs, err := File("testdata/flat.yaml")
+	pr := single(t, prs, err)
 	if pr.Format != ir.FormatFlat {
 		t.Errorf("Format = %v, want FormatFlat", pr.Format)
 	}
@@ -66,10 +77,8 @@ func TestBytes_exprAsInt(t *testing.T) {
 	// `expr: 0` (int in native flat) must be read as a string leaf without any
 	// typed dependency (ADR 0001).
 	src := []byte("groups:\n  - name: g\n    rules:\n      - record: up:count\n        expr: 0\n")
-	pr, err := Bytes("mem.yaml", src)
-	if err != nil {
-		t.Fatalf("Bytes: %v", err)
-	}
+	prs, err := Bytes("mem.yaml", src)
+	pr := single(t, prs, err)
 	got := pr.Groups[0].Rules[0].Expr
 	if got.Value != "0" {
 		t.Errorf("expr value = %q, want \"0\"", got.Value)
@@ -90,10 +99,8 @@ func TestBytes_aliasedExpr(t *testing.T) {
 		"    rules:\n" +
 		"      - alert: A\n" +
 		"        expr: *base\n")
-	pr, err := Bytes("mem.yaml", src)
-	if err != nil {
-		t.Fatalf("Bytes: %v", err)
-	}
+	prs, err := Bytes("mem.yaml", src)
+	pr := single(t, prs, err)
 	expr := pr.Groups[0].Rules[0].Expr
 	if expr.Value != "rate(http_requests_total[5m)" {
 		t.Errorf("expr value = %q, want the resolved (broken) expression, not the anchor name", expr.Value)
@@ -120,10 +127,8 @@ func TestBytes_labelMergeKey(t *testing.T) {
 		"        labels:\n" +
 		"          <<: *common\n" +
 		"          severity: page\n")
-	pr, err := Bytes("mem.yaml", src)
-	if err != nil {
-		t.Fatalf("Bytes: %v", err)
-	}
+	prs, err := Bytes("mem.yaml", src)
+	pr := single(t, prs, err)
 	labels := pr.Groups[0].Rules[0].Labels
 	if _, ok := labels["<<"]; ok {
 		t.Errorf("labels has a phantom \"<<\" key: %+v", labels)
@@ -156,10 +161,8 @@ func TestBytes_labelMergeSequence(t *testing.T) {
 		"        expr: up == 0\n" +
 		"        labels:\n" +
 		"          <<: [*a, *b]\n")
-	pr, err := Bytes("mem.yaml", src)
-	if err != nil {
-		t.Fatalf("Bytes: %v", err)
-	}
+	prs, err := Bytes("mem.yaml", src)
+	pr := single(t, prs, err)
 	labels := pr.Groups[0].Rules[0].Labels
 	if _, ok := labels["<<"]; ok {
 		t.Errorf("labels has a phantom \"<<\" key: %+v", labels)
@@ -170,4 +173,38 @@ func TestBytes_labelMergeSequence(t *testing.T) {
 	if tier := labels["tier"]; tier.Value != "gold" {
 		t.Errorf("labels.tier = %q, want merged-in \"gold\"", tier.Value)
 	}
+}
+
+func TestRule_invalidKind(t *testing.T) {
+	// A rule block must carry exactly one of alert:/record:. Neither or both is
+	// an Invalid rule — never silently minted as Alerting/Recording (ADR 0015).
+	t.Run("neither, points at a present leaf", func(t *testing.T) {
+		// alert:/record: both absent; only expr/for present (someone dropped the
+		// `alert:` key). expr is on line 4.
+		src := []byte("groups:\n  - name: g\n    rules:\n      - expr: up == 0\n        for: 5m\n")
+		prs, err := Bytes("mem.yaml", src)
+		pr := single(t, prs, err)
+		r := pr.Groups[0].Rules[0]
+		if r.Kind != ir.Invalid {
+			t.Errorf("kind = %v, want Invalid", r.Kind)
+		}
+		if r.Name.Present() {
+			t.Errorf("name should be absent, got %q", r.Name.Value)
+		}
+		if r.Pos.Line != 4 { // firstPos falls back to the first present leaf (expr@L4)
+			t.Errorf("pos line = %d, want 4 (the first present leaf)", r.Pos.Line)
+		}
+	})
+	t.Run("both, classified Invalid not Recording", func(t *testing.T) {
+		src := []byte("groups:\n  - name: g\n    rules:\n      - alert: A\n        record: r\n        expr: up\n")
+		prs, err := Bytes("mem.yaml", src)
+		pr := single(t, prs, err)
+		r := pr.Groups[0].Rules[0]
+		if r.Kind != ir.Invalid {
+			t.Errorf("kind = %v, want Invalid (a both-keys rule must not be silently Recording)", r.Kind)
+		}
+		if r.Pos.Line == 0 {
+			t.Errorf("pos should point at a present node, got line 0")
+		}
+	})
 }

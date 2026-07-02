@@ -30,13 +30,17 @@ func Run(files []string) (finding.Report, []FileError) {
 	checks := check.Registered()
 
 	for _, f := range files {
-		pr, err := parse.File(f)
+		// A file yields zero or more resources (ADR 0015); each is checked
+		// independently.
+		prs, err := parse.File(f)
 		if err != nil {
 			failures = append(failures, FileError{File: f, Err: err})
 			continue
 		}
-		for _, c := range checks {
-			report.Add(c.Check(pr)...)
+		for i := range prs {
+			for _, c := range checks {
+				report.Add(c.Check(&prs[i])...)
+			}
 		}
 	}
 	return report, failures
