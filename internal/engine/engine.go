@@ -1,10 +1,13 @@
 // Package engine wires the pipeline: parse each file into the IR, run every
 // registered check, aggregate into a Report.
 //
-// The parse-failure policy (Helm skip as advisory note, malformed as
+// The full parse-failure policy (Helm skip as advisory note, malformed as
 // enforceable error, plus the mandatory anti-hang guard — ADR 0002) is a later
-// slice. Until then a parse error is surfaced to the caller rather than being
-// swallowed: never a silent drop (the worst failure for a coverage tool).
+// slice. Until then every file is still processed: a file that fails to parse is
+// recorded as a FileError and returned alongside the Report, never swallowed.
+// Findings from the files that did parse are always kept — no silent drop (the
+// worst failure for a coverage tool), and the output no longer depends on the
+// order files are passed in.
 package engine
 
 import (
@@ -13,34 +16,39 @@ import (
 	"github.com/pbrissaud/alertsmith/internal/parse"
 )
 
-// Run parses and checks the given files, returning the aggregate Report.
+// Run parses and checks the given files, returning the aggregate Report plus the
+// per-file parse failures.
 //
-// A ParseError is returned for the first file that fails to parse; callers get
-// a non-silent failure. Later slices replace this with the full parse-failure
-// matrix (ADR 0002).
-func Run(files []string) (finding.Report, error) {
+// Every file is processed: a file that fails to parse is recorded as a
+// FileError and the loop continues, so findings from the parseable files are
+// always kept. The caller decides the exit policy from the (possibly empty)
+// failures slice. Later slices replace this flat slice with the full
+// parse-failure matrix (ADR 0002).
+func Run(files []string) (finding.Report, []FileError) {
 	var report finding.Report
+	var failures []FileError
 	checks := check.Registered()
 
 	for _, f := range files {
 		pr, err := parse.File(f)
 		if err != nil {
-			return report, &ParseError{File: f, Err: err}
+			failures = append(failures, FileError{File: f, Err: err})
+			continue
 		}
 		for _, c := range checks {
 			report.Add(c.Check(pr)...)
 		}
 	}
-	return report, nil
+	return report, failures
 }
 
-// ParseError signals that a file could not be parsed. It is a distinct type so
-// the parse-failure policy slice can replace this branch without touching
-// callers.
-type ParseError struct {
+// FileError records that a single file could not be parsed (or read). The run
+// continues past it; the aggregate Report is returned alongside these failures
+// so lost coverage is surfaced without discarding what did parse.
+type FileError struct {
 	File string
 	Err  error
 }
 
-func (e *ParseError) Error() string { return e.Err.Error() }
-func (e *ParseError) Unwrap() error { return e.Err }
+func (e FileError) Error() string { return e.Err.Error() }
+func (e FileError) Unwrap() error { return e.Err }

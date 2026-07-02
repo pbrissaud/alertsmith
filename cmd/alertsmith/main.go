@@ -12,6 +12,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -33,6 +34,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
+		// -h/--help is a successful request under ContinueOnError, not a usage
+		// error: flag.ErrHelp means the help text was already printed.
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
 		return 2
 	}
 	files := fs.Args()
@@ -41,15 +47,25 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	rep, err := engine.Run(files)
-	if err != nil {
-		fmt.Fprintln(stderr, "alertsmith:", err)
-		return 2
+	rep, failures := engine.Run(files)
+
+	// Render first, always: parse failures cost coverage but must never discard
+	// the findings we did compute for the files that parsed.
+	report.Text(stdout, rep)
+	for _, fe := range failures {
+		fmt.Fprintln(stderr, "alertsmith:", fe.Error())
 	}
 
-	report.Text(stdout, rep)
-	if rep.Empty() {
+	// Exit-code priority (lost coverage outranks findings):
+	//   2  at least one file failed to parse (some coverage was lost)
+	//   1  the report has findings
+	//   0  clean
+	switch {
+	case len(failures) > 0:
+		return 2
+	case !rep.Empty():
+		return 1
+	default:
 		return 0
 	}
-	return 1
 }

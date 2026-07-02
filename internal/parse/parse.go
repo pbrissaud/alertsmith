@@ -20,6 +20,10 @@ import (
 	"github.com/pbrissaud/alertsmith/internal/ir"
 )
 
+// mergeTag is the tag yaml.v3 resolves a `<<` merge key to. It is not exported
+// by the library, so we match on the tag string it documents.
+const mergeTag = "!!merge"
+
 // wire structs mirror the native flat format; every leaf is a yaml.Node so the
 // decoder records its line/column for us.
 type flatDoc struct {
@@ -93,18 +97,76 @@ func rule(file string, r *ruleNode) ir.Rule {
 	return out
 }
 
-// mapping reconstructs a labels/annotations block into value+position fields.
+// mapping reconstructs a labels/annotations block into value+position fields,
+// folding in YAML merge keys (`<<`). Prometheus honours merge keys when loading
+// rules, so we must too: otherwise the IR would carry a phantom label literally
+// named "<<" and silently drop the merged-in keys (ADR 0001 — we validate what
+// Prometheus actually sees).
 func mapping(file string, n *yaml.Node) map[string]ir.Field {
-	if n.Kind != yaml.MappingNode {
+	m := resolve(n)
+	if m.Kind != yaml.MappingNode {
 		return nil
 	}
-	out := make(map[string]ir.Field, len(n.Content)/2)
-	for i := 0; i+1 < len(n.Content); i += 2 {
-		key := n.Content[i]
-		val := n.Content[i+1]
+	out := make(map[string]ir.Field, len(m.Content)/2)
+	// Explicit keys first so they win over anything merged in (YAML semantics).
+	var merges []*yaml.Node
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		key, val := m.Content[i], m.Content[i+1]
+		if key.Tag == mergeTag {
+			merges = append(merges, val)
+			continue
+		}
 		out[key.Value] = field(file, val)
 	}
+	// Then fold in merged mappings. Earlier-listed sources win over later ones,
+	// and none override an explicit key — so we only add keys not already set.
+	for _, src := range merges {
+		for _, ms := range mergeSources(src) {
+			if ms.Kind != yaml.MappingNode {
+				continue
+			}
+			for i := 0; i+1 < len(ms.Content); i += 2 {
+				key, val := ms.Content[i], ms.Content[i+1]
+				if key.Tag == mergeTag {
+					continue // don't re-emit a nested "<<" as a label
+				}
+				if _, ok := out[key.Value]; ok {
+					continue
+				}
+				// The merged key's only real source is the anchor, so field()
+				// keeps its value (and position) from there; an aliased value is
+				// itself resolved.
+				out[key.Value] = field(file, val)
+			}
+		}
+	}
 	return out
+}
+
+// mergeSources expands a merge-key value into the mapping nodes it references.
+// The value is either a single alias-to-mapping or a sequence of them (`<<`).
+func mergeSources(n *yaml.Node) []*yaml.Node {
+	n = resolve(n)
+	if n.Kind != yaml.SequenceNode {
+		return []*yaml.Node{n}
+	}
+	out := make([]*yaml.Node, 0, len(n.Content))
+	for _, item := range n.Content {
+		out = append(out, resolve(item))
+	}
+	return out
+}
+
+// resolve follows a YAML alias to the node it points at. yaml.v3 leaves aliases
+// unresolved when a node is decoded into a yaml.Node field (the rulefmt
+// pattern), so `expr: *base` would otherwise yield the anchor NAME instead of
+// the referenced expression. Prometheus resolves aliases when loading rules, so
+// we must too (ADR 0001). A non-alias node is returned unchanged.
+func resolve(n *yaml.Node) *yaml.Node {
+	if n.Kind == yaml.AliasNode && n.Alias != nil {
+		return n.Alias
+	}
+	return n
 }
 
 // field reconstructs a scalar leaf into an ir.Field. An absent key decodes to a
@@ -113,7 +175,11 @@ func field(file string, n *yaml.Node) ir.Field {
 	if !present(n) {
 		return ir.Field{}
 	}
-	return ir.Field{Value: n.Value, Pos: pos(file, n)}
+	// Value comes from the resolved node (an alias points elsewhere); the
+	// position stays on the ORIGINAL usage so a finding points at the rule's own
+	// line, not the distant anchor definition (ADR 0001). For a plain scalar
+	// original == resolved, so behaviour is unchanged.
+	return ir.Field{Value: resolve(n).Value, Pos: pos(file, n)}
 }
 
 func pos(file string, n *yaml.Node) ir.Position {

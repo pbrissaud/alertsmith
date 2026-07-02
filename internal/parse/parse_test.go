@@ -75,3 +75,99 @@ func TestBytes_exprAsInt(t *testing.T) {
 		t.Errorf("expr value = %q, want \"0\"", got.Value)
 	}
 }
+
+func TestBytes_aliasedExpr(t *testing.T) {
+	// An anchor holding a BROKEN PromQL expr, referenced via *alias. yaml.v3
+	// leaves the alias unresolved when decoding into a yaml.Node, so without
+	// resolution the leaf would carry the anchor NAME ("base") — which parses
+	// fine as a bare selector and hides the bug. The parser must resolve it so
+	// the leaf holds the real (broken) expression text for promql-parse to catch.
+	src := []byte("" +
+		"anchors:\n" +
+		"  - &base rate(http_requests_total[5m)\n" + // missing ']' -> broken PromQL
+		"groups:\n" +
+		"  - name: g\n" +
+		"    rules:\n" +
+		"      - alert: A\n" +
+		"        expr: *base\n")
+	pr, err := Bytes("mem.yaml", src)
+	if err != nil {
+		t.Fatalf("Bytes: %v", err)
+	}
+	expr := pr.Groups[0].Rules[0].Expr
+	if expr.Value != "rate(http_requests_total[5m)" {
+		t.Errorf("expr value = %q, want the resolved (broken) expression, not the anchor name", expr.Value)
+	}
+	if !expr.Present() || expr.Pos.Line == 0 {
+		t.Errorf("expr should be positioned at its usage site, got line %d", expr.Pos.Line)
+	}
+}
+
+func TestBytes_labelMergeKey(t *testing.T) {
+	// `<<: *common` must be folded in (Prometheus honours YAML merge keys), with
+	// explicit keys winning over merged ones — not surfaced as a phantom "<<"
+	// label with the merged-in keys lost (ADR 0001).
+	src := []byte("" +
+		"anchors:\n" +
+		"  common: &common\n" +
+		"    team: sre\n" +
+		"    severity: ticket\n" +
+		"groups:\n" +
+		"  - name: g\n" +
+		"    rules:\n" +
+		"      - alert: A\n" +
+		"        expr: up == 0\n" +
+		"        labels:\n" +
+		"          <<: *common\n" +
+		"          severity: page\n")
+	pr, err := Bytes("mem.yaml", src)
+	if err != nil {
+		t.Fatalf("Bytes: %v", err)
+	}
+	labels := pr.Groups[0].Rules[0].Labels
+	if _, ok := labels["<<"]; ok {
+		t.Errorf("labels has a phantom \"<<\" key: %+v", labels)
+	}
+	if team := labels["team"]; team.Value != "sre" {
+		t.Errorf("labels.team = %q, want merged-in \"sre\"", team.Value)
+	}
+	if sev := labels["severity"]; sev.Value != "page" {
+		t.Errorf("labels.severity = %q, want explicit \"page\" to win over merged \"ticket\"", sev.Value)
+	}
+	if labels["team"].Pos.Line == 0 || labels["severity"].Pos.Line == 0 {
+		t.Errorf("positions must be non-zero: team@L%d severity@L%d",
+			labels["team"].Pos.Line, labels["severity"].Pos.Line)
+	}
+}
+
+func TestBytes_labelMergeSequence(t *testing.T) {
+	// A sequence merge (`<<: [*a, *b]`): earlier-listed source wins over later.
+	src := []byte("" +
+		"anchors:\n" +
+		"  a: &a\n" +
+		"    team: sre\n" +
+		"  b: &b\n" +
+		"    team: infra\n" +
+		"    tier: gold\n" +
+		"groups:\n" +
+		"  - name: g\n" +
+		"    rules:\n" +
+		"      - alert: A\n" +
+		"        expr: up == 0\n" +
+		"        labels:\n" +
+		"          <<: [*a, *b]\n")
+	pr, err := Bytes("mem.yaml", src)
+	if err != nil {
+		t.Fatalf("Bytes: %v", err)
+	}
+	labels := pr.Groups[0].Rules[0].Labels
+	if _, ok := labels["<<"]; ok {
+		t.Errorf("labels has a phantom \"<<\" key: %+v", labels)
+	}
+	if team := labels["team"]; team.Value != "sre" {
+		t.Errorf("labels.team = %q, want \"sre\" (first source wins)", team.Value)
+	}
+	if tier := labels["tier"]; tier.Value != "gold" {
+		t.Errorf("labels.tier = %q, want merged-in \"gold\"", tier.Value)
+	}
+}
