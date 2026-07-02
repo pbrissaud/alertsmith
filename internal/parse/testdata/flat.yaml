@@ -1,0 +1,12 @@
+groups:
+  - name: example
+    rules:
+      - alert: HighLatency
+        expr: rate(http_request_duration_seconds_sum[5m]) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: high latency
+      - record: job:http_requests:rate5m
+        expr: sum(rate(http_requests_total[5m])) by (job)
