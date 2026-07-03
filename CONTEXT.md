@@ -20,6 +20,10 @@ Une règle qui émet une alerte quand son expression PromQL est vraie (`alert:`)
 Une règle qui pré-calcule et stocke une métrique dérivée (`record:`). Peut être référencée par une alerting rule du même repo.
 _Avoid_: métrique dérivée (dans le contexte review)
 
+**Invalid rule**:
+Un bloc de règle qui n'est **ni** une alerting rule **ni** une recording rule : il ne porte pas exactement une des clés `alert:`/`record:` (aucune, ou les deux à la fois). Signalé par le Check `rule-structure` ; les Checks propres aux alerting rules ne s'y appliquent pas, pour éviter une cascade de faux positifs sur une règle déjà structurellement cassée.
+_Avoid_: le classer silencieusement en alerting rule (name vide) ou en recording rule (alerte perdue).
+
 ### Sortie de la review
 
 **Check**:
