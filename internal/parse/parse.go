@@ -1,4 +1,4 @@
-// Package parse turns a native flat Prometheus rule file into the home IR.
+// Package parse turns a Prometheus rule file into the home IR.
 //
 // Parsing is a single pass into typed structs whose leaf fields are yaml.Node
 // (the rulefmt pattern): this yields field-level positions without a generic
@@ -6,14 +6,25 @@
 // ir.Field values; rulefmt/promql are handed those reconstructed values as
 // validators and never sit on the unmarshal path.
 //
-// The walking skeleton handles the native flat format only, single document.
-// The CRD envelope, multi-document YAML and the parse-failure policy (Helm skip
-// / malformed / anti-hang guard) arrive in later slices (ADR 0002).
+// A file holds zero or more resources (ADR 0015): the documents of a `---`
+// stream, each detected by content (apiVersion + kind, never by path) as a
+// native flat rule file, a prometheus-operator CRD (a monitoring.coreos.com
+// PrometheusRule or PrometheusRuleList) or an unrelated K8s kind that is
+// ignored. The CRD path stays on the same yaml.Node-leaf structs — no
+// monitoringv1 dependency — so a CRD leaf carries a position exactly like a flat
+// one; reading `expr` as a node also absorbs the operator's intstr.IntOrString
+// (`expr: 0` int vs `"up == 0"` string).
+//
+// Still deferred: the parse-failure policy (Helm skip / malformed / anti-hang
+// guard, ADR 0002) — a malformed document still fails the whole file today.
 package parse
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"os"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 
@@ -24,12 +35,34 @@ import (
 // by the library, so we match on the tag string it documents.
 const mergeTag = "!!merge"
 
-// wire structs mirror the native flat format; every leaf is a yaml.Node so the
-// decoder records its line/column for us.
-type flatDoc struct {
+// doc is one decoded YAML document. Its rule leaves are yaml.Node (the rulefmt
+// pattern) so the decoder records their line/column; apiVersion/kind only drive
+// content detection and need no position. A given document fills at most one
+// shape: a flat file has `groups:` at the root, a CRD has `spec.groups`, a list
+// has `items`.
+type doc struct {
+	APIVersion string      `yaml:"apiVersion"`
+	Kind       string      `yaml:"kind"`
+	Groups     []groupNode `yaml:"groups"` // native flat: groups at the root
+	Spec       spec        `yaml:"spec"`   // CRD PrometheusRule: spec.groups
+	Items      []item      `yaml:"items"`  // PrometheusRuleList: items[].spec.groups
+}
+
+// spec is the CRD `spec:` we extract from; operator-only keys (interval, limit…)
+// have no field and are dropped by the lenient (non-KnownFields) decode.
+type spec struct {
 	Groups []groupNode `yaml:"groups"`
 }
 
+// item is one PrometheusRuleList entry — a full PrometheusRule, of which only
+// spec.groups is extracted, exactly like a standalone CRD.
+type item struct {
+	Spec spec `yaml:"spec"`
+}
+
+// groupNode/ruleNode mirror the rule-group shape shared by the flat root and the
+// CRD spec.groups; every leaf is a yaml.Node so the decoder records its
+// line/column for us.
 type groupNode struct {
 	Name  yaml.Node  `yaml:"name"`
 	Rules []ruleNode `yaml:"rules"`
@@ -47,9 +80,8 @@ type ruleNode struct {
 // File reads and parses a Prometheus rule file into its resources.
 //
 // A file holds zero or more PrometheusRule resources (a resource is not a file
-// — ADR 0015): one native flat document today, and with #2 several `---`
-// documents, a CRD, or a mix. The walking skeleton parses a single flat
-// document, so the slice has one element; #2 makes it additive.
+// — ADR 0015): the `---` documents of the stream, each a native flat file, a
+// CRD, or a member of a PrometheusRuleList; unrelated K8s kinds are ignored.
 func File(path string) ([]ir.PrometheusRule, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -60,24 +92,120 @@ func File(path string) ([]ir.PrometheusRule, error) {
 
 // Bytes parses rule content already in memory into its resources. The file name
 // is only used to stamp provenance.
+//
+// It streams the `---` documents in order; each is classified by content and
+// expanded into zero (an ignored kind or an empty document), one (a flat file or
+// a CRD PrometheusRule) or many (a PrometheusRuleList) resources. A malformed
+// document still fails the whole file — the per-document parse-failure matrix is
+// a later slice (ADR 0002).
 func Bytes(file string, data []byte) ([]ir.PrometheusRule, error) {
-	var doc flatDoc
-	if err := yaml.Unmarshal(data, &doc); err != nil {
-		return nil, fmt.Errorf("parse %s: %w", file, err)
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	var out []ir.PrometheusRule
+	for {
+		var d doc
+		err := dec.Decode(&d)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("parse %s: %w", file, err)
+		}
+		if d.empty() {
+			continue // a null / `---`-padding document carries no resource
+		}
+		switch classify(d) {
+		case docFlat:
+			out = append(out, resource(file, ir.FormatFlat, d.Groups))
+		case docCRD:
+			out = append(out, resource(file, ir.FormatCRD, d.Spec.Groups))
+		case docList:
+			// A list is one resource per item, each a CRD PrometheusRule.
+			for i := range d.Items {
+				out = append(out, resource(file, ir.FormatCRD, d.Items[i].Spec.Groups))
+			}
+		case docSkip:
+			// an unrelated K8s kind (ConfigMap, Deployment…): not a PrometheusRule
+		}
 	}
+	return out, nil
+}
 
-	pr := ir.PrometheusRule{File: file, Format: ir.FormatFlat}
-	for _, g := range doc.Groups {
+// docType is how a decoded document maps to resources.
+type docType int
+
+const (
+	docSkip docType = iota // an unrelated K8s kind: no resource
+	docFlat                // native flat file: groups at the root
+	docCRD                 // a prometheus-operator PrometheusRule: spec.groups
+	docList                // a PrometheusRuleList: one resource per item
+)
+
+const (
+	kindRule     = "PrometheusRule"
+	kindRuleList = "PrometheusRuleList"
+	// apiGroupCoreOS is the prometheus-operator API group prefix. Detection
+	// matches the group, not a pinned version: a v1beta1/v1alpha1 PrometheusRule
+	// must still be covered — silently skipping it is the worst failure for a
+	// coverage tool (ADR 0015).
+	apiGroupCoreOS = "monitoring.coreos.com/"
+)
+
+// classify decides what a document expands into, from its apiVersion + kind
+// (content detection — ADR 0001, never by path). No kind is a native flat file;
+// the operator kinds are honoured only under the monitoring.coreos.com group (or
+// a missing apiVersion); any other kind is an unrelated K8s object we ignore.
+func classify(d doc) docType {
+	switch d.Kind {
+	case "":
+		return docFlat
+	case kindRule:
+		if operatorGroup(d.APIVersion) {
+			return docCRD
+		}
+		return docSkip
+	case kindRuleList:
+		if operatorGroup(d.APIVersion) {
+			return docList
+		}
+		return docSkip
+	default:
+		return docSkip
+	}
+}
+
+// operatorGroup reports whether an apiVersion belongs to the prometheus-operator
+// group. An absent apiVersion is accepted (a kind: PrometheusRule that forgot
+// the field is still one); a foreign group borrowing the kind name is not.
+func operatorGroup(apiVersion string) bool {
+	return apiVersion == "" || strings.HasPrefix(apiVersion, apiGroupCoreOS)
+}
+
+// empty reports whether a decoded document carries nothing to extract — a null
+// document from `---` padding or a Helm template that rendered to nothing. It is
+// tested before classify because a null document and a flat one both have an
+// empty Kind; a stray apiVersion-only fragment with no groups is empty too, so
+// it is skipped rather than emitted as an empty flat resource.
+func (d doc) empty() bool {
+	return d.Kind == "" && len(d.Groups) == 0 && len(d.Spec.Groups) == 0 && len(d.Items) == 0
+}
+
+// resource builds one normalised PrometheusRule from a document's rule groups —
+// the same walk for the flat root, a CRD spec.groups and a list item, so the IR
+// downstream is identical regardless of the envelope.
+func resource(file string, format ir.Format, groups []groupNode) ir.PrometheusRule {
+	pr := ir.PrometheusRule{File: file, Format: format}
+	for i := range groups {
+		g := &groups[i]
 		group := ir.Group{
 			Name: field(file, &g.Name),
 			Pos:  pos(file, &g.Name),
 		}
-		for _, r := range g.Rules {
-			group.Rules = append(group.Rules, rule(file, &r))
+		for j := range g.Rules {
+			group.Rules = append(group.Rules, rule(file, &g.Rules[j]))
 		}
 		pr.Groups = append(pr.Groups, group)
 	}
-	return []ir.PrometheusRule{pr}, nil
+	return pr
 }
 
 func rule(file string, r *ruleNode) ir.Rule {
