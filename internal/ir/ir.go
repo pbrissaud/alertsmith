@@ -99,8 +99,9 @@ type Group struct {
 	Pos   Position
 }
 
-// Format records which envelope a PrometheusRule was decoded from. Flat is the
-// only format handled in the walking skeleton; CRD arrives in a later slice.
+// Format records which envelope a PrometheusRule was decoded from — a native
+// flat rule file or a prometheus-operator CRD. Both normalise to this same IR;
+// the format is provenance only, and the engine downstream is format-agnostic.
 type Format int
 
 const (
