@@ -50,12 +50,13 @@ func TestRun_exitCodes(t *testing.T) {
 	}
 }
 
-// A malformed file must not swallow the findings computed for the files that
-// did parse, and a parse failure must still be reported and exit 2 (Bug 1).
+// A parse failure must not swallow the findings computed for the files that did
+// parse. Under ADR 0002 a malformed file (no `{{`) is now a yaml-malformed
+// Finding, not lost coverage: both files' findings land in stdout and the run
+// exits 1 (findings), never 2 (which is reserved for unreadable files).
 func TestRun_multiFileKeepsFindingsDespiteParseError(t *testing.T) {
 	// First file parses fine and yields a real promql-parse finding; the second
-	// is malformed YAML (an unterminated flow sequence). Under the old
-	// abort-on-first-error behaviour the first file's finding was discarded.
+	// is malformed YAML (an unterminated flow sequence, no `{{`).
 	broken := write(t, "broken.yaml",
 		"groups:\n  - name: g\n    rules:\n      - alert: Broken\n        expr: this is (not valid\n")
 	malformed := write(t, "malformed.yaml", "groups: [unclosed\n")
@@ -63,14 +64,41 @@ func TestRun_multiFileKeepsFindingsDespiteParseError(t *testing.T) {
 	var out, errb bytes.Buffer
 	code := run([]string{broken, malformed}, &out, &errb)
 
-	if code != 2 {
-		t.Fatalf("exit = %d, want 2 (stderr: %s)", code, errb.String())
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1 (stderr: %s)", code, errb.String())
 	}
 	if !strings.Contains(out.String(), "promql-parse") {
 		t.Errorf("stdout = %q, want it to keep the first file's promql-parse finding", out.String())
 	}
-	if !strings.Contains(errb.String(), "malformed.yaml") {
-		t.Errorf("stderr = %q, want it to mention the malformed file", errb.String())
+	if !strings.Contains(out.String(), "yaml-malformed") {
+		t.Errorf("stdout = %q, want the malformed file surfaced as a yaml-malformed finding", out.String())
+	}
+	if errb.String() != "" {
+		t.Errorf("stderr = %q, want empty: a parse failure is a finding, not a FileError", errb.String())
+	}
+}
+
+// A Helm-templated file (control-flow `{{- if }}`) is skipped as an advisory
+// helm-skipped note. It is a finding to show (exit 1) but never lost coverage
+// (exit 2): the file was recognised, not dropped (ADR 0002).
+func TestRun_helmTemplatedSkipped(t *testing.T) {
+	helm := write(t, "chart.yaml",
+		"groups:\n  - name: g\n{{- if .Values.enabled }}\n    rules: []\n{{- end }}\n")
+
+	var out, errb bytes.Buffer
+	code := run([]string{helm}, &out, &errb)
+
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1 (stderr: %s)", code, errb.String())
+	}
+	if !strings.Contains(out.String(), "helm-skipped") {
+		t.Errorf("stdout = %q, want a helm-skipped finding", out.String())
+	}
+	if !strings.Contains(out.String(), "note") {
+		t.Errorf("stdout = %q, want the helm-skipped finding at level note", out.String())
+	}
+	if errb.String() != "" {
+		t.Errorf("stderr = %q, want empty: a skipped Helm file is a finding, not a FileError", errb.String())
 	}
 }
 
