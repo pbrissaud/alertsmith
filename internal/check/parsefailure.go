@@ -1,6 +1,9 @@
 package check
 
 import (
+	"regexp"
+	"strings"
+
 	"github.com/pbrissaud/alertsmith/internal/finding"
 	"github.com/pbrissaud/alertsmith/internal/ir"
 )
@@ -33,7 +36,7 @@ func ParseFailureFinding(helm bool, pos ir.Position, cause string) finding.Findi
 			Level:       finding.Note,
 			Origin:      finding.Deterministic,
 			Enforceable: false,
-			Message:     "skipped: Helm-templated, not valid YAML before rendering (" + cause + ")",
+			Message:     "skipped: Helm-templated, not valid YAML before rendering (" + cleanCause(cause) + ")",
 			Pos:         pos,
 		}
 	}
@@ -42,7 +45,24 @@ func ParseFailureFinding(helm bool, pos ir.Position, cause string) finding.Findi
 		Level:       finding.Error,
 		Origin:      finding.Deterministic,
 		Enforceable: true,
-		Message:     "YAML does not parse: " + cause,
+		Message:     "YAML does not parse: " + cleanCause(cause),
 		Pos:         pos,
 	}
+}
+
+// intoTypeRe matches the "into <Go type>" tail yaml.v3 appends to a *TypeError
+// ("… cannot unmarshal !!str into []parse.groupNode"), naming an unexported
+// package type the user cannot act on. The phrase " into " appears only in those
+// type-mismatch messages, so stripping it is safe.
+var intoTypeRe = regexp.MustCompile(` into \[?\]?[\w./*]+`)
+
+// cleanCause makes a raw yaml.v3 error fit for the finding Message, which
+// report.Text renders as one line per finding: a *TypeError is multi-line
+// ("yaml: unmarshal errors:\n  line N: …") and leaks internal Go type names.
+// We drop the "into <type>" tail and collapse all whitespace (including
+// newlines) to single spaces, so a broken document never emits a stray,
+// prefix-less continuation line into the machine-readable stdout stream.
+func cleanCause(s string) string {
+	s = intoTypeRe.ReplaceAllString(s, "")
+	return strings.Join(strings.Fields(s), " ")
 }

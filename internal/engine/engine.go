@@ -45,6 +45,15 @@ func Run(files []string) (finding.Report, []FileError) {
 			// A hard I/O error (unreadable file): coverage genuinely lost.
 			failures = append(failures, FileError{File: f, Err: err})
 		}
+		// A Helm-skipped file is skipped as a whole — a single helm-skipped
+		// Finding (ADR 0002). Its pre-poison documents hold un-rendered Helm
+		// scalars, not final rules, so checking them would emit enforceable false
+		// positives (e.g. a promql-parse error on `{{ .Values.expr }}`) on a file
+		// the note explicitly did NOT judge. A malformed file's earlier documents
+		// are genuine and stay checked.
+		if fail != nil && fail.Helm {
+			continue
+		}
 		for i := range prs {
 			for _, c := range checks {
 				report.Add(c.Check(&prs[i])...)

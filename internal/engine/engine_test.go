@@ -86,20 +86,44 @@ func TestRun_unreadableFileIsLostCoverage(t *testing.T) {
 	}
 }
 
-func TestRun_cleanDocsBeforePoisonStillChecked(t *testing.T) {
-	// File-level granularity keeps the documents decoded before a poison: a first
-	// doc with a broken PromQL expr (valid YAML) is still checked and yields a
-	// promql-parse finding, alongside the file's helm-skipped skip.
+func TestRun_cleanDocsBeforeMalformedStillChecked(t *testing.T) {
+	// For a MALFORMED (non-Helm) file, file-level granularity keeps the documents
+	// decoded before the break: a first doc with a broken PromQL expr (valid YAML)
+	// is still checked and yields a promql-parse finding, alongside the file's
+	// yaml-malformed error. Those earlier docs are genuine rules, not un-rendered
+	// Helm, so checking them is real coverage.
 	f := write(t, "mixed.yaml",
 		"groups:\n  - name: g\n    rules:\n      - alert: A\n        expr: this is (not valid\n"+
-			"---\n{{- if .X }}\nfoo: bar\n{{- end }}\n")
+			"---\ngroups: [unclosed\n")
 
 	rep, failures := Run([]string{f})
 	if len(failures) != 0 {
 		t.Errorf("failures = %v, want none", failures)
 	}
-	checkOf(t, rep, "promql-parse") // the clean doc before the poison was checked
-	checkOf(t, rep, "helm-skipped") // the poison was surfaced, not dropped
+	checkOf(t, rep, "promql-parse")   // the doc before the break was checked
+	checkOf(t, rep, "yaml-malformed") // the break was surfaced, not dropped
+}
+
+func TestRun_helmFileYieldsSingleFinding(t *testing.T) {
+	// A Helm file is skipped whole (ADR 0002: "un seul Finding helm-skipped").
+	// Its first doc holds an un-rendered templated expr (`{{ .Values.expr }}`,
+	// valid YAML) before a control-flow poison — running promql-parse on it would
+	// emit an ENFORCEABLE false positive on a file we said we did NOT judge. Only
+	// the advisory helm-skipped note must survive.
+	f := write(t, "chart.yaml",
+		"groups:\n  - name: g\n    rules:\n      - alert: A\n        expr: '{{ .Values.expr }}'\n"+
+			"---\n{{- if .Values.enabled }}\nfoo: bar\n{{- end }}\n")
+
+	rep, failures := Run([]string{f})
+	if len(failures) != 0 {
+		t.Errorf("failures = %v, want none", failures)
+	}
+	if len(rep.Findings) != 1 {
+		t.Fatalf("findings = %d, want exactly 1 (%+v)", len(rep.Findings), rep.Findings)
+	}
+	if got := rep.Findings[0].Check; got != "helm-skipped" {
+		t.Errorf("the sole finding is %q, want helm-skipped (no enforceable check on un-rendered Helm)", got)
+	}
 }
 
 func TestRun_noSilentDrop(t *testing.T) {

@@ -1,6 +1,7 @@
 package check
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/pbrissaud/alertsmith/internal/finding"
@@ -42,5 +43,28 @@ func TestParseFailureFinding(t *testing.T) {
 		if !f.Enforceable {
 			t.Errorf("Enforceable = false, want true: malformed YAML may block")
 		}
+		// Symmetric with the helm branch: the enforceable, blocking finding must
+		// also carry a deterministic origin and a clickable position (ADR 0011).
+		if f.Origin != finding.Deterministic {
+			t.Errorf("origin = %v, want deterministic", f.Origin)
+		}
+		if f.Pos != pos {
+			t.Errorf("pos = %+v, want %+v", f.Pos, pos)
+		}
 	})
+}
+
+func TestParseFailureFinding_cleansCause(t *testing.T) {
+	// A yaml *TypeError is multi-line and names an unexported Go type. The finding
+	// Message must stay a single line (report.Text is one line per finding) and
+	// not leak internals, or a broken document corrupts the machine-readable
+	// stdout stream and exposes `parse.groupNode` (review F5/F7).
+	cause := "yaml: unmarshal errors:\n  line 1: cannot unmarshal !!str `oops` into []parse.groupNode"
+	f := ParseFailureFinding(false, ir.Position{File: "f.yaml", Line: 1, Col: 1}, cause)
+	if strings.Contains(f.Message, "\n") {
+		t.Errorf("message is multi-line, want a single line: %q", f.Message)
+	}
+	if strings.Contains(f.Message, "parse.groupNode") {
+		t.Errorf("message leaks the internal type name: %q", f.Message)
+	}
 }

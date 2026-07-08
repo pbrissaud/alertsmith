@@ -1,6 +1,6 @@
 # Templating Helm : skip bruyant en V1
 
-Une `PrometheusRule` templatée Helm (`{{ .Values.x }}`) n'est pas du YAML valide avant rendu. En V1, on **skip bruyant** : le fichier est sauté mais on émet un **Finding de Level `note`, *advisory*** (0006 — jamais enforceable, donc il ne peut **jamais** bloquer, quel que soit `block_on`) : « sauté : templaté Helm ». Jamais un drop silencieux — cohérent avec la promesse #1 (couverture), dont la logique dit que le pire échec est le silence. Détection **par contenu** : le parse YAML échoue **et** le fichier contient `{{`/`}}` (pas de fiabilité sur le path `templates/` ni sur un `Chart.yaml` voisin).
+Une `PrometheusRule` templatée Helm (`{{ .Values.x }}`) n'est pas du YAML valide avant rendu. En V1, on **skip bruyant** : le fichier est sauté mais on émet un **Finding de Level `note`, *advisory*** (0006 — jamais enforceable, donc il ne peut **jamais** bloquer, quel que soit `block_on`) : « sauté : templaté Helm ». Jamais un drop silencieux — cohérent avec la promesse #1 (couverture), dont la logique dit que le pire échec est le silence. Détection **par contenu** (pas de fiabilité sur le path `templates/` ni sur un `Chart.yaml` voisin) : le parse YAML échoue **et** le fichier porte des **marqueurs Helm** — les tokens de trim `{{-`/`-}}` et les objets de contexte chart (`.Values`, `.Release`, `.Chart`, `.Capabilities`, `.Files`). **Pas** un scan brut de `{{`/`}}` : les annotations Prometheus natives templatisent avec **les mêmes délimiteurs** (`{{ $value }}`, `{{ $labels.instance }}`), donc un scan brut déclasse un fichier natif réellement cassé en note advisory et le fait passer sous la porte enforceable `yaml-malformed` (bug relevé en revue). Les marqueurs retenus (trim + contexte `.`-rooté) sont ceux que le templating Prometheus, qui utilise les variables `$`, n'emploie jamais — une heuristique, pas une preuve (le résiduel : une annotation Prometheus qui utilise elle-même `{{-`, faux-Helm rare et du côté sûr, car advisory).
 
 ## Considered options
 
@@ -9,10 +9,10 @@ Une `PrometheusRule` templatée Helm (`{{ .Values.x }}`) n'est pas du YAML valid
 
 ## Politique d'échec de parse (le cas `{{` n'est qu'un sous-cas)
 
-Un échec de parse **sans** `{{` = YAML réellement malformé → **Finding `error`, enforceable** (peut bloquer), *pas* un skip `note`. La matrice complète :
+Un échec de parse **sans** marqueur Helm = YAML réellement malformé → **Finding `error`, enforceable** (peut bloquer), *pas* un skip `note`. La matrice complète :
 - parse OK → checks normaux.
-- parse KO **et** contient `{{` → skip Helm (`note`, **advisory**).
-- parse KO **sans** `{{` → malformé (`error`, **enforceable**).
+- parse KO **et** marqueurs Helm présents → skip Helm (`note`, **advisory**). Fichier sauté *en entier* : ses documents pré-poison portent des scalaires Helm non rendus, donc **un seul** Finding `helm-skipped`, aucun check enforceable sur ces docs.
+- parse KO **sans** marqueur Helm → malformé (`error`, **enforceable**). Les documents décodés *avant* la casse sont de vraies règles → checkés normalement.
 
 ## Granularité file-level : subie, pas choisie — *confirmé par spike*
 

@@ -58,14 +58,30 @@ func TestBytes_yamlMalformed(t *testing.T) {
 
 func TestBytes_helmClassifiedByContentNotPath(t *testing.T) {
 	// Detection is by CONTENT, never by path: a file that fails to parse and
-	// contains `{{` anywhere is Helm-templated, even if the break itself is a
-	// plain flow error. A false "Helm" is the safe side — helm-skipped is an
-	// advisory note that can never block (ADR 0002).
+	// carries a Helm chart marker (`.Chart`) anywhere is Helm-templated, even if
+	// the break itself is a plain flow error.
 	src := []byte("# rendered from {{ .Chart.Name }}\ngroups: [unclosed\n")
 	_, err := Bytes("weird.yaml", src)
 	f := wantFailure(t, err)
 	if !f.Helm {
-		t.Errorf("Helm = false, want true (the file contains `{{`, wherever it broke)")
+		t.Errorf("Helm = false, want true (the file carries a Helm chart marker)")
+	}
+}
+
+func TestBytes_malformedNativeWithAnnotationTemplating(t *testing.T) {
+	// The load-bearing distinction (review F1): native Prometheus annotations
+	// legitimately use Go-template delimiters (`{{ $value }}`, `{{ $labels.x }}`),
+	// so a genuinely-broken native rule file that contains them must NOT be
+	// downgraded to an advisory helm-skipped note — it stays an enforceable
+	// yaml-malformed error. Helm detection keys on Helm-specific markers, not a
+	// bare `{{` scan.
+	src := []byte("groups:\n  - name: g\n    rules:\n" +
+		"      - alert: A\n        expr: up == 0\n" +
+		"        annotations:\n          summary: \"{{ $value }} is high\n") // unterminated string, no Helm markers
+	_, err := Bytes("native.yaml", src)
+	f := wantFailure(t, err)
+	if f.Helm {
+		t.Errorf("Helm = true, want false: `{{ $value }}` is Prometheus annotation templating, not Helm — a real error here must stay enforceable")
 	}
 }
 
