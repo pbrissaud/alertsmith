@@ -8,7 +8,11 @@
 //
 //	0  no findings
 //	1  findings were produced
-//	2  usage or a runtime error (e.g. a file that could not be parsed)
+//	2  usage or a runtime error (e.g. a file that could not be read)
+//
+// A file that fails to *parse* no longer exits 2: it is classified into a
+// helm-skipped or yaml-malformed Finding (ADR 0002), so it exits 1 like any
+// other finding. Only a hard I/O error (unreadable file) is lost coverage → 2.
 package main
 
 import (
@@ -49,15 +53,15 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	rep, failures := engine.Run(files)
 
-	// Render first, always: parse failures cost coverage but must never discard
-	// the findings we did compute for the files that parsed.
+	// Render first, always: an unreadable file costs coverage but must never
+	// discard the findings we did compute for the files that parsed.
 	report.Text(stdout, rep)
 	for _, fe := range failures {
 		fmt.Fprintln(stderr, "alertsmith:", fe.Error())
 	}
 
 	// Exit-code priority (lost coverage outranks findings):
-	//   2  at least one file failed to parse (some coverage was lost)
+	//   2  at least one file could not be read (some coverage was lost)
 	//   1  the report has findings
 	//   0  clean
 	switch {

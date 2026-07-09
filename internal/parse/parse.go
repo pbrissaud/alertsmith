@@ -15,15 +15,20 @@
 // one; reading `expr` as a node also absorbs the operator's intstr.IntOrString
 // (`expr: 0` int vs `"up == 0"` string).
 //
-// Still deferred: the parse-failure policy (Helm skip / malformed / anti-hang
-// guard, ADR 0002) — a malformed document still fails the whole file today.
+// Parse-failure policy (ADR 0002): a document that does not decode never fails
+// silently. The stream stops at the first decode error — bailing there is the
+// mandatory anti-hang guard, because a syntax error makes yaml.v3 return the
+// same error forever without advancing (a poisoning stream). The failure is
+// then classified by content into a [Failure] the caller turns into a Finding
+// (Helm-templated skip vs genuinely malformed).
 package parse
 
 import (
 	"bytes"
-	"fmt"
 	"io"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -82,6 +87,10 @@ type ruleNode struct {
 // A file holds zero or more PrometheusRule resources (a resource is not a file
 // — ADR 0015): the `---` documents of the stream, each a native flat file, a
 // CRD, or a member of a PrometheusRuleList; unrelated K8s kinds are ignored.
+//
+// The returned error is either a plain I/O error (the file could not be read, a
+// hard failure) or a classified [Failure] from Bytes (a parse failure the caller
+// turns into a Finding); errors.As tells them apart.
 func File(path string) ([]ir.PrometheusRule, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -95,9 +104,10 @@ func File(path string) ([]ir.PrometheusRule, error) {
 //
 // It streams the `---` documents in order; each is classified by content and
 // expanded into zero (an ignored kind or an empty document), one (a flat file or
-// a CRD PrometheusRule) or many (a PrometheusRuleList) resources. A malformed
-// document still fails the whole file — the per-document parse-failure matrix is
-// a later slice (ADR 0002).
+// a CRD PrometheusRule) or many (a PrometheusRuleList) resources. On a decode
+// error it returns the resources decoded so far together with a classified
+// [Failure] in the error slot (nil error on a clean parse) — never a silent
+// drop (ADR 0002).
 func Bytes(file string, data []byte) ([]ir.PrometheusRule, error) {
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	var out []ir.PrometheusRule
@@ -108,7 +118,22 @@ func Bytes(file string, data []byte) ([]ir.PrometheusRule, error) {
 			break
 		}
 		if err != nil {
-			return nil, fmt.Errorf("parse %s: %w", file, err)
+			// MANDATORY anti-hang guard (ADR 0002). A *syntax* error poisons the
+			// rest of a `---` stream: yaml.v3 (v3.0.1, pinned) returns the SAME
+			// error on every further Decode without advancing and never reaches
+			// EOF — a naive continue-on-error loop spun to 5.4 GB before the OOM
+			// kill (spike). The decoder exposes no resumable offset to skip the
+			// bad document, so bailing on this first non-progressing error IS the
+			// guard; it is a non-blocking condition of the Action, not an option.
+			//
+			// A *type* error (a `*yaml.TypeError`, e.g. a scalar where a sequence
+			// is expected) would actually advance the decoder, so subsequent docs
+			// are technically recoverable — but V1 stops uniformly for file-level
+			// granularity (recovering them is the deferred "dégradé" of ADR 0002).
+			// Documents decoded before this point are kept, the ones after are
+			// unreachable; the failure is classified by content and surfaced as a
+			// Finding by the caller.
+			return out, newFailure(file, data, err)
 		}
 		if d.empty() {
 			continue // a null / `---`-padding document carries no resource
@@ -128,6 +153,85 @@ func Bytes(file string, data []byte) ([]ir.PrometheusRule, error) {
 		}
 	}
 	return out, nil
+}
+
+// Failure is a classified parse failure: the document stream stopped early and
+// the caller MUST surface it as a Finding — never a silent drop, the worst
+// failure for a coverage tool (ADR 0002). It implements error so a parse
+// function can return it in the error slot; the engine recovers it with
+// errors.As and mints the matching Finding, distinguishing it from a plain I/O
+// error (an unreadable file, which stays a hard failure).
+type Failure struct {
+	// Helm is the content-detection verdict: the file contains `{{`/`}}`, so it
+	// is a Helm template to skip as an advisory note rather than YAML that is
+	// genuinely malformed (an enforceable error). Detection is by content, never
+	// by path — a `templates/` dir or a neighbouring Chart.yaml are not reliable
+	// (ADR 0002).
+	Helm  bool
+	Pos   ir.Position // file + best-effort line of the failing document
+	Cause error       // the underlying yaml decode error
+}
+
+func (f *Failure) Error() string { return f.Cause.Error() }
+func (f *Failure) Unwrap() error { return f.Cause }
+
+// newFailure classifies a decode error. The Helm verdict is content detection
+// over the WHOLE file (ADR 0002), keyed on Helm-specific markers rather than a
+// bare `{{` scan — see helmMarkers for why a bare scan is wrong.
+func newFailure(file string, data []byte, cause error) *Failure {
+	return &Failure{
+		Helm:  looksHelmTemplated(data),
+		Pos:   ir.Position{File: file, Line: errorLine(cause), Col: 1},
+		Cause: cause,
+	}
+}
+
+// helmMarkers are byte sequences characteristic of Helm/Go-template *control*
+// and *chart context* — the templating that actually breaks YAML before
+// rendering (the ADR 0002 spike: `{{- if }}`/`{{- end }}` control-flow poisons
+// the parse). A bare `{{`/`}}` scan is wrong: native Prometheus rules routinely
+// template their annotations with the SAME delimiters (`{{ $value }}`,
+// `{{ $labels.instance }}`), so a genuinely-malformed native file would be
+// misclassified as an advisory Helm skip and slip past the enforceable
+// yaml-malformed gate. These markers key on the whitespace-trim tokens and the
+// `.`-rooted chart objects that Prometheus's `$`-variable templating never uses.
+//
+// The discriminator is a heuristic, not a proof (ADR 0002 already notes content
+// detection is unreliable): a Prometheus annotation that itself uses `{{-` trim
+// markers is a rare residual false-Helm. That is the safe side — helm-skipped is
+// advisory and can never block, so it cannot turn a broken file into a blocked
+// merge, whereas the far more common `{{ $value }}` false positive of the old
+// bare scan silently downgraded real errors.
+var helmMarkers = [][]byte{
+	[]byte("{{-"), []byte("-}}"), // whitespace-trim markers: Go-template control
+	[]byte(".Values"), []byte(".Release"), []byte(".Chart"), // Helm chart objects
+	[]byte(".Capabilities"), []byte(".Files"),
+}
+
+func looksHelmTemplated(data []byte) bool {
+	for _, m := range helmMarkers {
+		if bytes.Contains(data, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// yamlLineRe matches the 1-based line yaml.v3 embeds in a decode error
+// ("yaml: line N: …"). yaml.v3 is pinned in go.mod, so the format is stable.
+var yamlLineRe = regexp.MustCompile(`line (\d+)`)
+
+// errorLine best-effort extracts that line, falling back to line 1 (top of
+// file) so a file-level Finding always carries a renderable anchor (ADR 0011):
+// some syntax errors (e.g. "invalid map key") carry no line, and an unrecognised
+// format degrades to line 1 rather than a wrong line.
+func errorLine(err error) int {
+	if m := yamlLineRe.FindStringSubmatch(err.Error()); m != nil {
+		if n, e := strconv.Atoi(m[1]); e == nil && n > 0 {
+			return n
+		}
+	}
+	return 1
 }
 
 // docType is how a decoded document maps to resources.
